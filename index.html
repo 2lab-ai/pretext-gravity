@@ -48,12 +48,13 @@
     bottom: 20px;
     left: 50%;
     transform: translateX(-50%);
-    font-size: 12px;
+    font-size: 11px;
     color: rgba(255,255,255,0.3);
     z-index: 20;
     text-align: center;
     font-family: monospace;
     pointer-events: auto;
+    line-height: 1.6;
   }
   #info a { color: rgba(255,255,255,0.5); text-decoration: none; }
   #info a:hover { color: rgba(255,255,255,0.8); }
@@ -66,6 +67,16 @@
     z-index: 20;
     transition: color 0.5s, opacity 0.5s;
     opacity: 0.4;
+  }
+  #stats {
+    position: fixed;
+    top: 40px;
+    right: 20px;
+    font-size: 10px;
+    font-family: monospace;
+    z-index: 20;
+    opacity: 0.25;
+    color: rgba(255,255,255,0.6);
   }
   @keyframes pulse-ring {
     0% { transform: translate(-50%, -50%) scale(0.3); opacity: 0.8; }
@@ -87,8 +98,9 @@
 <div id="cursor-glow"></div>
 <canvas id="c"></canvas>
 <div id="mode-indicator">⊕ REPEL</div>
+<div id="stats"></div>
 <div id="info">
-  move your cursor — click to toggle repel/attract — scroll to change mass<br>
+  move · click=mode · scroll=mass · right-click=pin gravity · W=wave<br>
   built with <a href="https://github.com/chenglou/pretext" target="_blank">pretext</a> ·
   <a href="https://github.com/2lab-ai/pretext-gravity" target="_blank">source</a>
 </div>
@@ -100,28 +112,37 @@ const canvas = document.getElementById('c')
 const ctx = canvas.getContext('2d')
 const glow = document.getElementById('cursor-glow')
 const modeEl = document.getElementById('mode-indicator')
+const statsEl = document.getElementById('stats')
 
 // --- State ---
 let W, H, dpr
 let mouseX = -1000, mouseY = -1000
 let targetMouseX = -1000, targetMouseY = -1000
+let prevMouseX = -1000, prevMouseY = -1000
+let mouseSpeed = 0
 let gravityRadius = 180
 let gravityStrength = 120
 let attractMode = false
+let waveMode = false
 let time = 0
 let shockwaves = []
+let pinnedWells = [] // right-click to pin gravity sources
+let fps = 60
+let frameCount = 0
+let lastFpsTime = performance.now()
 
 // Background stars
 let stars = []
 function initStars() {
   stars = []
-  for (let i = 0; i < 80; i++) {
+  for (let i = 0; i < 100; i++) {
     stars.push({
       x: Math.random() * W,
       y: Math.random() * H,
-      size: 0.5 + Math.random() * 1.5,
-      twinkleSpeed: 0.5 + Math.random() * 2,
+      size: 0.3 + Math.random() * 1.8,
+      twinkleSpeed: 0.3 + Math.random() * 2.5,
       twinkleOffset: Math.random() * Math.PI * 2,
+      hue: 200 + Math.random() * 60,
     })
   }
 }
@@ -147,7 +168,7 @@ const paragraphs = [
 
 const fullText = paragraphs.join(' ✦ ')
 
-// --- Resize ---
+// --- Layout ---
 let chars = []
 const fontSize = 18
 const lineHeight = 32
@@ -175,11 +196,10 @@ function buildLines() {
     let cursor = { segmentIndex: 0, graphemeIndex: 0 }
     let y = padding + 20
 
-    while (y < H - padding - 40) {
+    while (y < H - padding - 60) {
       const maxW = W - padding * 2
       const line = layoutNextLine(prepared, cursor, maxW)
       if (line === null) {
-        // Loop text
         cursor = { segmentIndex: 0, graphemeIndex: 0 }
         const line2 = layoutNextLine(prepared, cursor, maxW)
         if (line2 === null) break
@@ -192,15 +212,12 @@ function buildLines() {
       y += lineHeight
     }
   } catch(e) {
-    // Fallback: manually split text using canvas measurement
     let y = padding + 20
     let textIdx = 0
-
-    while (y < H - padding - 40 && textIdx < fullText.length * 3) {
+    while (y < H - padding - 60 && textIdx < fullText.length * 3) {
       let x = padding
       const maxW = W - padding * 2
-
-      while (x < padding + maxW && textIdx % fullText.length < fullText.length) {
+      while (x < padding + maxW && textIdx < fullText.length * 3) {
         const ch = fullText[textIdx % fullText.length]
         const w = ctx.measureText(ch).width
         if (x + w > padding + maxW) break
@@ -209,7 +226,6 @@ function buildLines() {
         textIdx++
       }
       y += lineHeight
-      if (textIdx >= fullText.length * 3) break
     }
   }
 }
@@ -229,80 +245,115 @@ function pushChar(ch, x, y) {
     char: ch,
     baseX: x,
     baseY: y,
-    x: x,
-    y: y,
+    x, y,
     vx: 0,
     vy: 0,
     rotation: 0,
     scale: 1,
     opacity: 0.8 + Math.random() * 0.2,
     hue: 30 + Math.random() * 20,
-    trail: [], // position history for trail effect
+    trail: [],
   })
 }
 
 // --- Physics ---
+function applyGravityWell(p, wx, wy, radius, strength, attract) {
+  const dx = p.x - wx
+  const dy = p.y - wy
+  const dist = Math.sqrt(dx * dx + dy * dy)
+  if (dist < radius && dist > 1) {
+    const falloff = 1 - dist / radius
+    const force = strength * falloff * falloff / dist
+    const fx = dx * force
+    const fy = dy * force
+    const dt = 0.016
+    if (attract) {
+      p.vx -= fx * dt * 2.5
+      p.vy -= fy * dt * 2.5
+    } else {
+      p.vx += fx * dt * 2.5
+      p.vy += fy * dt * 2.5
+    }
+    return falloff
+  }
+  return 0
+}
+
 function updatePhysics() {
-  const dt = 0.016
   const friction = 0.91
   const returnForce = 0.06
 
-  // Smooth mouse interpolation
+  // Mouse speed
+  const mdx = targetMouseX - prevMouseX
+  const mdy = targetMouseY - prevMouseY
+  mouseSpeed = Math.sqrt(mdx * mdx + mdy * mdy)
+  prevMouseX = targetMouseX
+  prevMouseY = targetMouseY
+
+  // Smooth mouse
   mouseX += (targetMouseX - mouseX) * 0.15
   mouseY += (targetMouseY - mouseY) * 0.15
 
+  // Dynamic gravity boost from mouse speed
+  const speedBoost = 1 + Math.min(mouseSpeed / 30, 2)
+
   for (const p of chars) {
-    const dx = p.x - mouseX
-    const dy = p.y - mouseY
-    const dist = Math.sqrt(dx * dx + dy * dy)
+    // Main cursor gravity
+    const proximity = applyGravityWell(
+      p, mouseX, mouseY,
+      gravityRadius * speedBoost,
+      gravityStrength * speedBoost,
+      attractMode
+    )
 
-    if (dist < gravityRadius && dist > 1) {
-      const falloff = 1 - dist / gravityRadius
-      const force = gravityStrength * falloff * falloff / dist  // quadratic falloff for smoother feel
-      const fx = dx * force
-      const fy = dy * force
+    // Pinned wells
+    let maxPinnedProx = 0
+    for (const w of pinnedWells) {
+      const prox = applyGravityWell(p, w.x, w.y, w.radius, w.strength, w.attract)
+      maxPinnedProx = Math.max(maxPinnedProx, prox)
+    }
 
-      if (attractMode) {
-        p.vx -= fx * dt * 2.5
-        p.vy -= fy * dt * 2.5
-      } else {
-        p.vx += fx * dt * 2.5
-        p.vy += fy * dt * 2.5
-      }
+    const totalProximity = Math.max(proximity, maxPinnedProx)
 
-      // Color shift near cursor
-      const proximity = falloff
+    // Wave mode: sine displacement
+    if (waveMode) {
+      const waveAmp = 3
+      const waveFreq = 0.015
+      const waveSpeed = 2
+      p.vy += Math.sin(p.baseX * waveFreq + time * waveSpeed) * waveAmp * 0.1
+      p.vx += Math.cos(p.baseY * waveFreq * 0.7 + time * waveSpeed * 0.6) * waveAmp * 0.05
+    }
+
+    // Color
+    if (totalProximity > 0.01) {
       p.hue = attractMode
-        ? 200 + proximity * 80   // deep blue → cyan when attracting
-        : 15 + proximity * 45    // amber → red when repelling
-      p.opacity = 0.8 + proximity * 0.2
-      p.scale = 1 + proximity * 0.4  // grow near cursor
-
+        ? 200 + totalProximity * 80
+        : 15 + totalProximity * 45
+      p.opacity = 0.8 + totalProximity * 0.2
+      p.scale = 1 + totalProximity * 0.4
     } else {
-      // Fade back to default
       p.hue += (35 - p.hue) * 0.03
       p.opacity += (0.75 - p.opacity) * 0.03
       p.scale += (1 - p.scale) * 0.05
     }
 
-    // Spring back to base position
+    // Spring return
     p.vx += (p.baseX - p.x) * returnForce
     p.vy += (p.baseY - p.y) * returnForce
 
-    // Apply velocity with friction
+    // Integrate
     p.vx *= friction
     p.vy *= friction
     p.x += p.vx
     p.y += p.vy
 
-    // Rotation based on velocity
+    // Rotation from velocity
     const speed = Math.sqrt(p.vx * p.vx + p.vy * p.vy)
     const targetRotation = Math.atan2(p.vy, p.vx) * (Math.min(speed, 8) / 8) * 0.3
     p.rotation += (targetRotation - p.rotation) * 0.1
 
-    // Trail update (keep last 3 positions, disabled if too many chars for perf)
-    const enableTrails = chars.length < 2000
-    if (enableTrails) {
+    // Trails (perf gated)
+    if (chars.length < 2000) {
       if (speed > 1.5) {
         p.trail.push({ x: p.x, y: p.y, opacity: 0.3 })
         if (p.trail.length > 3) p.trail.shift()
@@ -313,7 +364,6 @@ function updatePhysics() {
     }
   }
 
-  // Update shockwaves
   shockwaves = shockwaves.filter(s => Date.now() - s.time < 600)
 }
 
@@ -321,7 +371,7 @@ function updatePhysics() {
 function render() {
   ctx.clearRect(0, 0, W, H)
 
-  // Background: subtle dark gradient
+  // Background
   const bgGrad = ctx.createRadialGradient(W/2, H/2, 0, W/2, H/2, Math.max(W, H) * 0.7)
   bgGrad.addColorStop(0, '#0e0e18')
   bgGrad.addColorStop(1, '#07070b')
@@ -333,51 +383,94 @@ function render() {
     const twinkle = 0.3 + 0.7 * (0.5 + 0.5 * Math.sin(time * s.twinkleSpeed + s.twinkleOffset))
     ctx.beginPath()
     ctx.arc(s.x, s.y, s.size, 0, Math.PI * 2)
-    ctx.fillStyle = `rgba(200, 210, 240, ${twinkle * 0.3})`
+    ctx.fillStyle = `hsla(${s.hue}, 40%, 80%, ${twinkle * 0.25})`
     ctx.fill()
   }
 
-  // Gravity field gradient
-  const grad = ctx.createRadialGradient(mouseX, mouseY, 0, mouseX, mouseY, gravityRadius * 1.5)
-  if (attractMode) {
-    grad.addColorStop(0, 'rgba(30, 60, 150, 0.12)')
-    grad.addColorStop(0.5, 'rgba(20, 40, 100, 0.05)')
-    grad.addColorStop(1, 'transparent')
-  } else {
-    grad.addColorStop(0, 'rgba(150, 60, 20, 0.12)')
-    grad.addColorStop(0.5, 'rgba(100, 40, 15, 0.05)')
-    grad.addColorStop(1, 'transparent')
-  }
-  ctx.fillStyle = grad
-  ctx.fillRect(0, 0, W, H)
+  // Draw all gravity well fields (cursor + pinned)
+  const wells = [
+    { x: mouseX, y: mouseY, radius: gravityRadius, attract: attractMode },
+    ...pinnedWells,
+  ]
+  for (const w of wells) {
+    // Field gradient
+    const grad = ctx.createRadialGradient(w.x, w.y, 0, w.x, w.y, w.radius * 1.5)
+    if (w.attract) {
+      grad.addColorStop(0, 'rgba(30, 60, 150, 0.10)')
+      grad.addColorStop(0.5, 'rgba(20, 40, 100, 0.04)')
+      grad.addColorStop(1, 'transparent')
+    } else {
+      grad.addColorStop(0, 'rgba(150, 60, 20, 0.10)')
+      grad.addColorStop(0.5, 'rgba(100, 40, 15, 0.04)')
+      grad.addColorStop(1, 'transparent')
+    }
+    ctx.fillStyle = grad
+    ctx.fillRect(
+      Math.max(0, w.x - w.radius * 1.5),
+      Math.max(0, w.y - w.radius * 1.5),
+      w.radius * 3, w.radius * 3
+    )
 
-  // Gravity field lines (subtle concentric rings)
-  for (let r = 1; r <= 3; r++) {
-    const ringR = gravityRadius * (r / 3)
-    const ringOpacity = 0.03 + 0.01 * Math.sin(time * 2 + r)
-    ctx.beginPath()
-    ctx.arc(mouseX, mouseY, ringR, 0, Math.PI * 2)
-    ctx.strokeStyle = attractMode
-      ? `rgba(100, 150, 255, ${ringOpacity})`
-      : `rgba(255, 150, 80, ${ringOpacity})`
-    ctx.lineWidth = 0.5
-    ctx.stroke()
+    // Concentric rings
+    for (let r = 1; r <= 3; r++) {
+      const ringR = (w.radius || gravityRadius) * (r / 3)
+      const ringOpacity = 0.025 + 0.01 * Math.sin(time * 2 + r)
+      ctx.beginPath()
+      ctx.arc(w.x, w.y, ringR, 0, Math.PI * 2)
+      ctx.strokeStyle = w.attract
+        ? `rgba(100, 150, 255, ${ringOpacity})`
+        : `rgba(255, 150, 80, ${ringOpacity})`
+      ctx.lineWidth = 0.5
+      ctx.stroke()
+    }
   }
 
-  // Draw character trails
+  // Constellation lines between nearby fast chars (pre-filtered for perf)
+  if (chars.length < 1500) {
+    const activeChars = []
+    for (let i = 0; i < chars.length; i++) {
+      const c = chars[i]
+      if (c.vx * c.vx + c.vy * c.vy > 4) activeChars.push(c) // speed > 2
+    }
+    if (activeChars.length > 1 && activeChars.length < 300) {
+      ctx.lineWidth = 0.5
+      const threshold = 35
+      const t2 = threshold * threshold
+      for (let i = 0; i < activeChars.length; i++) {
+        const a = activeChars[i]
+        for (let j = i + 1; j < activeChars.length; j++) {
+          const b = activeChars[j]
+          const dx = a.x - b.x
+          const dy = a.y - b.y
+          const d2 = dx * dx + dy * dy
+          if (d2 < t2) {
+            const alpha = (1 - Math.sqrt(d2) / threshold) * 0.15
+            ctx.beginPath()
+            ctx.moveTo(a.x, a.y)
+            ctx.lineTo(b.x, b.y)
+            ctx.strokeStyle = attractMode
+              ? `rgba(120, 170, 255, ${alpha})`
+              : `rgba(255, 170, 100, ${alpha})`
+            ctx.stroke()
+          }
+        }
+      }
+    }
+  }
+
+  // Trails
   ctx.font = font
   ctx.textBaseline = 'top'
   for (const p of chars) {
     for (const t of p.trail) {
-      ctx.save()
-      ctx.globalAlpha = t.opacity * 0.4
+      ctx.globalAlpha = t.opacity * 0.35
       ctx.fillStyle = `hsla(${p.hue}, 60%, 70%, 1)`
       ctx.fillText(p.char, t.x, t.y)
-      ctx.restore()
     }
   }
+  ctx.globalAlpha = 1
 
-  // Draw characters
+  // Characters
   for (const p of chars) {
     const speed = Math.sqrt(p.vx * p.vx + p.vy * p.vy)
     const sat = 50 + speed * 8
@@ -392,32 +485,41 @@ function render() {
     ctx.restore()
   }
 
-  // Cursor dot
-  const cursorSize = 3 + Math.sin(time * 3) * 0.5
+  // Cursor visualization
+  const cursorPulse = 3 + Math.sin(time * 3) * 0.5
   ctx.beginPath()
-  ctx.arc(mouseX, mouseY, cursorSize, 0, Math.PI * 2)
-  const cursorColor = attractMode ? 'rgba(100, 180, 255, 0.9)' : 'rgba(255, 160, 80, 0.9)'
-  ctx.fillStyle = cursorColor
+  ctx.arc(mouseX, mouseY, cursorPulse, 0, Math.PI * 2)
+  ctx.fillStyle = attractMode ? 'rgba(100, 180, 255, 0.9)' : 'rgba(255, 160, 80, 0.9)'
   ctx.fill()
+
+  // Speed ring — grows with mouse speed
+  const speedRing = Math.min(mouseSpeed * 0.8, 40)
+  if (speedRing > 2) {
+    ctx.beginPath()
+    ctx.arc(mouseX, mouseY, cursorPulse + speedRing, 0, Math.PI * 2)
+    ctx.strokeStyle = attractMode
+      ? `rgba(100, 180, 255, ${0.1 + speedRing / 100})`
+      : `rgba(255, 160, 80, ${0.1 + speedRing / 100})`
+    ctx.lineWidth = 0.8
+    ctx.stroke()
+  }
 
   // Cursor glow ring
   ctx.beginPath()
-  ctx.arc(mouseX, mouseY, cursorSize + 6, 0, Math.PI * 2)
-  ctx.strokeStyle = attractMode ? 'rgba(100, 180, 255, 0.2)' : 'rgba(255, 160, 80, 0.2)'
+  ctx.arc(mouseX, mouseY, cursorPulse + 6, 0, Math.PI * 2)
+  ctx.strokeStyle = attractMode ? 'rgba(100, 180, 255, 0.15)' : 'rgba(255, 160, 80, 0.15)'
   ctx.lineWidth = 1
   ctx.stroke()
 
-  // Floating orbital particles
+  // Orbital particles
   time += 0.015
-  const particleCount = 8
-  for (let i = 0; i < particleCount; i++) {
-    const a = time * 0.4 + (i / particleCount) * Math.PI * 2
+  for (let i = 0; i < 8; i++) {
+    const a = time * 0.4 + (i / 8) * Math.PI * 2
     const r = gravityRadius * 0.25 + Math.sin(time * 1.5 + i * 1.3) * 25
     const px = mouseX + Math.cos(a) * r
     const py = mouseY + Math.sin(a) * r
     const size = 1 + Math.sin(time * 2 + i * 0.7) * 0.8
-    const pAlpha = 0.2 + Math.sin(time * 1.5 + i) * 0.15
-
+    const pAlpha = 0.2 + Math.sin(time * 1.5 + i) * 0.12
     ctx.beginPath()
     ctx.arc(px, py, size, 0, Math.PI * 2)
     ctx.fillStyle = attractMode
@@ -426,18 +528,53 @@ function render() {
     ctx.fill()
   }
 
-  // Inner orbital ring (faster, tighter)
+  // Inner orbital
   for (let i = 0; i < 4; i++) {
     const a = -time * 0.8 + (i / 4) * Math.PI * 2
     const r = 15 + Math.sin(time * 2 + i) * 5
-    const px = mouseX + Math.cos(a) * r
-    const py = mouseY + Math.sin(a) * r
     ctx.beginPath()
-    ctx.arc(px, py, 0.8, 0, Math.PI * 2)
-    ctx.fillStyle = attractMode
-      ? 'rgba(180, 220, 255, 0.5)'
-      : 'rgba(255, 220, 180, 0.5)'
+    ctx.arc(mouseX + Math.cos(a) * r, mouseY + Math.sin(a) * r, 0.8, 0, Math.PI * 2)
+    ctx.fillStyle = attractMode ? 'rgba(180, 220, 255, 0.4)' : 'rgba(255, 220, 180, 0.4)'
     ctx.fill()
+  }
+
+  // Pinned well markers
+  for (const w of pinnedWells) {
+    ctx.beginPath()
+    ctx.arc(w.x, w.y, 4, 0, Math.PI * 2)
+    ctx.fillStyle = w.attract ? 'rgba(100, 180, 255, 0.6)' : 'rgba(255, 150, 80, 0.6)'
+    ctx.fill()
+    ctx.beginPath()
+    ctx.arc(w.x, w.y, 8, 0, Math.PI * 2)
+    ctx.strokeStyle = w.attract ? 'rgba(100, 180, 255, 0.2)' : 'rgba(255, 150, 80, 0.2)'
+    ctx.lineWidth = 1
+    ctx.stroke()
+  }
+
+  // Wave mode indicator
+  if (waveMode) {
+    // Draw a small sine wave icon at top-left
+    ctx.save()
+    ctx.strokeStyle = 'rgba(150, 200, 255, 0.3)'
+    ctx.lineWidth = 1.5
+    ctx.beginPath()
+    for (let i = 0; i < 40; i++) {
+      const sx = 20 + i
+      const sy = 55 + Math.sin(i * 0.3 + time * 3) * 6
+      i === 0 ? ctx.moveTo(sx, sy) : ctx.lineTo(sx, sy)
+    }
+    ctx.stroke()
+    ctx.restore()
+  }
+
+  // FPS counter
+  frameCount++
+  const now = performance.now()
+  if (now - lastFpsTime > 500) {
+    fps = Math.round(frameCount / ((now - lastFpsTime) / 1000))
+    frameCount = 0
+    lastFpsTime = now
+    statsEl.textContent = `${chars.length} chars · ${fps} fps${pinnedWells.length ? ` · ${pinnedWells.length} wells` : ''}${waveMode ? ' · wave' : ''}`
   }
 }
 
@@ -448,15 +585,15 @@ function loop() {
   requestAnimationFrame(loop)
 }
 
-// --- Shockwave on mode toggle ---
-function createShockwave() {
+// --- Shockwave ---
+function createShockwave(x, y, color) {
   const el = document.createElement('div')
   el.className = 'shockwave'
-  el.style.left = mouseX + 'px'
-  el.style.top = mouseY + 'px'
-  el.style.borderColor = attractMode
+  el.style.left = x + 'px'
+  el.style.top = y + 'px'
+  el.style.borderColor = color || (attractMode
     ? 'rgba(100, 180, 255, 0.6)'
-    : 'rgba(255, 150, 80, 0.6)'
+    : 'rgba(255, 150, 80, 0.6)')
   document.body.appendChild(el)
   shockwaves.push({ time: Date.now() })
   setTimeout(() => el.remove(), 700)
@@ -473,7 +610,7 @@ window.addEventListener('mousemove', e => {
 window.addEventListener('click', () => {
   attractMode = !attractMode
 
-  // Impulse burst — push/pull all chars in radius
+  // Impulse burst
   for (const p of chars) {
     const dx = p.x - mouseX
     const dy = p.y - mouseY
@@ -490,7 +627,7 @@ window.addEventListener('click', () => {
     }
   }
 
-  createShockwave()
+  createShockwave(mouseX, mouseY)
 
   glow.style.background = attractMode
     ? 'radial-gradient(circle, rgba(80,130,255,0.18) 0%, rgba(50,100,255,0.06) 40%, transparent 70%)'
@@ -498,6 +635,22 @@ window.addEventListener('click', () => {
 
   modeEl.style.color = attractMode ? 'rgba(100, 180, 255, 0.6)' : 'rgba(255, 150, 80, 0.6)'
   modeEl.textContent = attractMode ? '⊖ ATTRACT' : '⊕ REPEL'
+})
+
+// Right-click: pin a gravity well
+window.addEventListener('contextmenu', e => {
+  e.preventDefault()
+  if (pinnedWells.length >= 5) {
+    pinnedWells.shift() // max 5 pinned wells
+  }
+  pinnedWells.push({
+    x: e.clientX,
+    y: e.clientY,
+    radius: gravityRadius * 0.7,
+    strength: gravityStrength * 0.5,
+    attract: attractMode,
+  })
+  createShockwave(e.clientX, e.clientY, 'rgba(200, 100, 255, 0.5)')
 })
 
 window.addEventListener('wheel', e => {
@@ -509,30 +662,30 @@ window.addEventListener('wheel', e => {
 
 window.addEventListener('resize', resize)
 
-// Touch support
+// Touch
 let lastTap = 0
 window.addEventListener('touchmove', e => {
   e.preventDefault()
-  targetMouseX = e.touches[0].clientX
-  targetMouseY = e.touches[0].clientY
-  glow.style.left = targetMouseX + 'px'
-  glow.style.top = targetMouseY + 'px'
+  if (e.touches.length === 1) {
+    targetMouseX = e.touches[0].clientX
+    targetMouseY = e.touches[0].clientY
+    glow.style.left = targetMouseX + 'px'
+    glow.style.top = targetMouseY + 'px'
+  }
 }, { passive: false })
 
 window.addEventListener('touchstart', e => {
   targetMouseX = e.touches[0].clientX
   targetMouseY = e.touches[0].clientY
 
-  // Double tap to toggle mode
   const now = Date.now()
   if (now - lastTap < 300) {
-    // Trigger click (mode toggle)
     window.dispatchEvent(new Event('click'))
   }
   lastTap = now
 })
 
-// Pinch to zoom gravity radius (2-finger)
+// Pinch
 let initialPinchDist = null
 window.addEventListener('touchmove', e => {
   if (e.touches.length === 2) {
@@ -550,17 +703,34 @@ window.addEventListener('touchmove', e => {
   }
 }, { passive: true })
 
-window.addEventListener('touchend', () => {
-  initialPinchDist = null
-})
+window.addEventListener('touchend', () => { initialPinchDist = null })
 
-// --- Keyboard shortcuts ---
+// Long press on mobile = pin well
+let longPressTimer = null
+window.addEventListener('touchstart', e => {
+  if (e.touches.length === 1) {
+    longPressTimer = setTimeout(() => {
+      if (pinnedWells.length >= 5) pinnedWells.shift()
+      pinnedWells.push({
+        x: e.touches[0].clientX,
+        y: e.touches[0].clientY,
+        radius: gravityRadius * 0.7,
+        strength: gravityStrength * 0.5,
+        attract: attractMode,
+      })
+      createShockwave(e.touches[0].clientX, e.touches[0].clientY, 'rgba(200, 100, 255, 0.5)')
+    }, 500)
+  }
+})
+window.addEventListener('touchmove', () => { clearTimeout(longPressTimer) })
+window.addEventListener('touchend', () => { clearTimeout(longPressTimer) })
+
+// Keyboard
 window.addEventListener('keydown', e => {
   if (e.key === ' ') {
     e.preventDefault()
     window.dispatchEvent(new Event('click'))
   }
-  // R = reset positions
   if (e.key === 'r' || e.key === 'R') {
     for (const p of chars) {
       p.x = p.baseX
@@ -569,9 +739,13 @@ window.addEventListener('keydown', e => {
       p.vy = 0
       p.rotation = 0
       p.scale = 1
+      p.trail = []
     }
+    pinnedWells = []
   }
-  // Up/Down = adjust gravity
+  if (e.key === 'w' || e.key === 'W') {
+    waveMode = !waveMode
+  }
   if (e.key === 'ArrowUp') {
     gravityRadius = Math.min(500, gravityRadius + 20)
     gravityStrength = gravityRadius * 0.67
@@ -580,12 +754,15 @@ window.addEventListener('keydown', e => {
     gravityRadius = Math.max(50, gravityRadius - 20)
     gravityStrength = gravityRadius * 0.67
   }
+  // Number keys 1-3: presets
+  if (e.key === '1') { gravityRadius = 100; gravityStrength = 67 }
+  if (e.key === '2') { gravityRadius = 250; gravityStrength = 168 }
+  if (e.key === '3') { gravityRadius = 450; gravityStrength = 302 }
 })
 
 // --- Init ---
 let pretextLoaded = false
 try {
-  // Test that pretext actually works
   const testPrepared = prepareWithSegments('test', font)
   const testLine = layoutNextLine(testPrepared, { segmentIndex: 0, graphemeIndex: 0 }, 200)
   if (testLine && testLine.text) pretextLoaded = true
@@ -596,17 +773,12 @@ try {
 resize()
 loop()
 
-// Show pretext status
+// Pretext status
 const statusEl = document.createElement('div')
 statusEl.style.cssText = 'position:fixed;top:20px;left:20px;font:11px monospace;z-index:20;opacity:0.3;'
 statusEl.textContent = pretextLoaded ? '✓ pretext' : '⚠ fallback'
 statusEl.style.color = pretextLoaded ? 'rgba(100,255,150,0.5)' : 'rgba(255,150,100,0.5)'
 document.body.appendChild(statusEl)
-
-// Fade in info
-setTimeout(() => {
-  document.getElementById('info').style.opacity = '1'
-}, 500)
 </script>
 </body>
 </html>
