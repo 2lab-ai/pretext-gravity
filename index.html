@@ -4,6 +4,19 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Gravity Well — Text Bends Around Your Cursor</title>
+
+<!-- OG Meta -->
+<meta property="og:title" content="Gravity Well — Text Bends Around Your Cursor">
+<meta property="og:description" content="Interactive canvas experiment: every character is a particle in a gravity field. Built with pretext for precise multilingual text layout.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://2lab-ai.github.io/pretext-gravity/">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Gravity Well">
+<meta name="twitter:description" content="Text bends around your cursor like spacetime curves around mass.">
+
+<!-- Favicon -->
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🕳️</text></svg>">
+
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body {
@@ -287,14 +300,16 @@ function updatePhysics() {
     const targetRotation = Math.atan2(p.vy, p.vx) * (Math.min(speed, 8) / 8) * 0.3
     p.rotation += (targetRotation - p.rotation) * 0.1
 
-    // Trail update (keep last 3 positions)
-    if (speed > 1.5) {
-      p.trail.push({ x: p.x, y: p.y, opacity: 0.3 })
-      if (p.trail.length > 3) p.trail.shift()
-    } else {
-      // Fade out trail
-      for (const t of p.trail) t.opacity *= 0.85
-      p.trail = p.trail.filter(t => t.opacity > 0.02)
+    // Trail update (keep last 3 positions, disabled if too many chars for perf)
+    const enableTrails = chars.length < 2000
+    if (enableTrails) {
+      if (speed > 1.5) {
+        p.trail.push({ x: p.x, y: p.y, opacity: 0.3 })
+        if (p.trail.length > 3) p.trail.shift()
+      } else {
+        for (const t of p.trail) t.opacity *= 0.85
+        p.trail = p.trail.filter(t => t.opacity > 0.02)
+      }
     }
   }
 
@@ -568,8 +583,25 @@ window.addEventListener('keydown', e => {
 })
 
 // --- Init ---
+let pretextLoaded = false
+try {
+  // Test that pretext actually works
+  const testPrepared = prepareWithSegments('test', font)
+  const testLine = layoutNextLine(testPrepared, { segmentIndex: 0, graphemeIndex: 0 }, 200)
+  if (testLine && testLine.text) pretextLoaded = true
+} catch(e) {
+  pretextLoaded = false
+}
+
 resize()
 loop()
+
+// Show pretext status
+const statusEl = document.createElement('div')
+statusEl.style.cssText = 'position:fixed;top:20px;left:20px;font:11px monospace;z-index:20;opacity:0.3;'
+statusEl.textContent = pretextLoaded ? '✓ pretext' : '⚠ fallback'
+statusEl.style.color = pretextLoaded ? 'rgba(100,255,150,0.5)' : 'rgba(255,150,100,0.5)'
+document.body.appendChild(statusEl)
 
 // Fade in info
 setTimeout(() => {
