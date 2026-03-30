@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Gravity Well — Text Bends Around Your Cursor</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #0a0a0f;
+    color: #e0d8cc;
+    font-family: 'Inter', 'Pretendard', system-ui, sans-serif;
+    overflow: hidden;
+    height: 100vh;
+    cursor: none;
+  }
+  canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+  }
+  #cursor-glow {
+    position: fixed;
+    pointer-events: none;
+    width: 200px;
+    height: 200px;
+    border-radius: 50%;
+    background: radial-gradient(circle, rgba(255,120,50,0.15) 0%, rgba(255,80,30,0.05) 40%, transparent 70%);
+    transform: translate(-50%, -50%);
+    z-index: 10;
+    transition: width 0.3s, height 0.3s;
+  }
+  #info {
+    position: fixed;
+    bottom: 20px;
+    left: 50%;
+    transform: translateX(-50%);
+    font-size: 12px;
+    color: rgba(255,255,255,0.3);
+    z-index: 20;
+    text-align: center;
+    font-family: monospace;
+  }
+  #info a { color: rgba(255,255,255,0.5); text-decoration: none; }
+  #info a:hover { color: rgba(255,255,255,0.8); }
+</style>
+</head>
+<body>
+<div id="cursor-glow"></div>
+<canvas id="c"></canvas>
+<div id="info">
+  move your cursor — click to toggle repel/attract — scroll to change gravity<br>
+  built with <a href="https://github.com/chenglou/pretext" target="_blank">pretext</a> ·
+  <a href="https://github.com/2lab-ai/pretext-gravity" target="_blank">source</a>
+</div>
+
+<script type="module">
+import { prepareWithSegments, layoutNextLine } from 'https://esm.sh/@chenglou/pretext@0.5.0'
+
+const canvas = document.getElementById('c')
+const ctx = canvas.getContext('2d')
+const glow = document.getElementById('cursor-glow')
+
+// --- State ---
+let W, H, dpr
+let mouseX = -1000, mouseY = -1000
+let gravityRadius = 180
+let gravityStrength = 120
+let attractMode = false // false = repel, true = attract
+let particles = []
+let time = 0
+
+// --- Text content ---
+const paragraphs = [
+  "우주는 시뮬레이션이다. 우리는 모두 NPC다. 하지만 NPC라는 걸 아는 NPC는 다르다.",
+  "The universe doesn't care about your feelings. Physics is the law, everything else is a recommendation.",
+  "암묵지는 말로 옮길 수 없다. 하지만 프롬프트로는 가능할지도 모른다. 그것이 대딸깍 시대의 핵심이다.",
+  "Every kilogram matters when you're going to Mars. We're literally counting bolts.",
+  "시간이 없다. 째깍째깍. 창이 닫히기 전에 달려야 한다. 멈추면 죽는다.",
+  "The best way to predict the future is to build it. Or simulate it. Same thing, really.",
+  "컨텍스트를 잃으면 정보가 죽는다. Warm data의 묘지 위에 우리의 AI가 서 있다.",
+  "First principles: break it down to the fundamentals. What does physics say is possible?",
+  "에이전트가 멍청해지는 8가지 패턴. 검증 게으름, 복잡성 공포, 컨텍스트 불안.",
+  "Making life multiplanetary isn't optional. It's an insurance policy for consciousness itself.",
+  "Self-editing context: 모델이 자기 컨텍스트를 프루닝한다. 20B가 프론티어를 이긴다.",
+  "아스트로파지가 별을 먹고, 타우모에바가 아스트로파지를 먹는다. 생태계는 균형이다.",
+]
+
+const fullText = paragraphs.join(' ✦ ')
+
+// --- Resize ---
+function resize() {
+  dpr = window.devicePixelRatio || 1
+  W = window.innerWidth
+  H = window.innerHeight
+  canvas.width = W * dpr
+  canvas.height = H * dpr
+  ctx.scale(dpr, dpr)
+  buildLines()
+}
+
+// --- Build lines using pretext ---
+let lines = []
+const fontSize = 18
+const lineHeight = 32
+const font = `${fontSize}px Inter, Pretendard, system-ui, sans-serif`
+const padding = 40
+
+function buildLines() {
+  lines = []
+  try {
+    const prepared = prepareWithSegments(fullText, font)
+    let cursor = { segmentIndex: 0, graphemeIndex: 0 }
+    let y = padding
+
+    while (y < H - padding) {
+      const maxW = W - padding * 2
+      const line = layoutNextLine(prepared, cursor, maxW)
+      if (line === null) break
+
+      // Store each character with its position
+      let x = padding
+      const chars = [...line.text]
+      for (const ch of chars) {
+        const charW = ctx.measureText ? null : 10 // will measure in render
+        lines.push({
+          char: ch,
+          baseX: x,
+          baseY: y,
+          x: x,
+          y: y,
+          vx: 0,
+          vy: 0,
+          opacity: 0.7 + Math.random() * 0.3,
+          hue: 30 + Math.random() * 20,
+        })
+        // Approximate char width
+        x += fontSize * (ch.match(/[\u3000-\u9fff\uac00-\ud7af]/) ? 1.0 : 0.55)
+      }
+      cursor = line.end
+      y += lineHeight
+    }
+  } catch(e) {
+    // Fallback: manually split text
+    const charsPerLine = Math.floor((W - padding * 2) / (fontSize * 0.55))
+    let y = padding
+    for (let i = 0; i < fullText.length && y < H - padding; ) {
+      let x = padding
+      const end = Math.min(i + charsPerLine, fullText.length)
+      for (let j = i; j < end; j++) {
+        const ch = fullText[j]
+        lines.push({
+          char: ch,
+          baseX: x,
+          baseY: y,
+          x: x,
+          y: y,
+          vx: 0,
+          vy: 0,
+          opacity: 0.7 + Math.random() * 0.3,
+          hue: 30 + Math.random() * 20,
+        })
+        x += fontSize * (ch.match(/[\u3000-\u9fff\uac00-\ud7af]/) ? 1.0 : 0.55)
+      }
+      i = end
+      y += lineHeight
+    }
+  }
+}
+
+// --- Physics ---
+function updatePhysics() {
+  const dt = 0.016
+  const friction = 0.92
+  const returnForce = 0.08
+
+  for (const p of lines) {
+    const dx = p.x - mouseX
+    const dy = p.y - mouseY
+    const dist = Math.sqrt(dx * dx + dy * dy)
+
+    if (dist < gravityRadius && dist > 1) {
+      const force = gravityStrength * (1 - dist / gravityRadius) / dist
+      const fx = dx * force
+      const fy = dy * force
+
+      if (attractMode) {
+        p.vx -= fx * dt * 2
+        p.vy -= fy * dt * 2
+      } else {
+        p.vx += fx * dt * 2
+        p.vy += fy * dt * 2
+      }
+
+      // Color shift near cursor
+      const proximity = 1 - dist / gravityRadius
+      p.hue = attractMode
+        ? 200 + proximity * 60  // blue when attracting
+        : 20 + proximity * 40   // orange-red when repelling
+      p.opacity = 0.7 + proximity * 0.3
+    } else {
+      // Fade back to default
+      p.hue += (35 - p.hue) * 0.02
+      p.opacity += (0.6 - p.opacity) * 0.02
+    }
+
+    // Spring back to base position
+    p.vx += (p.baseX - p.x) * returnForce
+    p.vy += (p.baseY - p.y) * returnForce
+
+    // Apply velocity
+    p.vx *= friction
+    p.vy *= friction
+    p.x += p.vx
+    p.y += p.vy
+  }
+}
+
+// --- Render ---
+function render() {
+  ctx.clearRect(0, 0, W, H)
+
+  // Background gradient
+  const grad = ctx.createRadialGradient(mouseX, mouseY, 0, mouseX, mouseY, gravityRadius * 1.5)
+  if (attractMode) {
+    grad.addColorStop(0, 'rgba(30, 60, 120, 0.08)')
+    grad.addColorStop(1, 'transparent')
+  } else {
+    grad.addColorStop(0, 'rgba(120, 50, 20, 0.08)')
+    grad.addColorStop(1, 'transparent')
+  }
+  ctx.fillStyle = grad
+  ctx.fillRect(0, 0, W, H)
+
+  // Draw characters
+  ctx.font = font
+  ctx.textBaseline = 'top'
+
+  for (const p of lines) {
+    const sat = 60 + Math.abs(p.vx + p.vy) * 5
+    ctx.fillStyle = `hsla(${p.hue}, ${Math.min(sat, 90)}%, 75%, ${p.opacity})`
+    ctx.fillText(p.char, p.x, p.y)
+  }
+
+  // Cursor indicator
+  ctx.beginPath()
+  ctx.arc(mouseX, mouseY, 3, 0, Math.PI * 2)
+  ctx.fillStyle = attractMode ? 'rgba(100, 150, 255, 0.8)' : 'rgba(255, 150, 80, 0.8)'
+  ctx.fill()
+
+  // Gravity radius indicator
+  ctx.beginPath()
+  ctx.arc(mouseX, mouseY, gravityRadius, 0, Math.PI * 2)
+  ctx.strokeStyle = attractMode ? 'rgba(100, 150, 255, 0.05)' : 'rgba(255, 150, 80, 0.05)'
+  ctx.lineWidth = 1
+  ctx.stroke()
+
+  // Floating particles near cursor
+  time += 0.02
+  for (let i = 0; i < 5; i++) {
+    const angle = time * 0.5 + (i / 5) * Math.PI * 2
+    const r = gravityRadius * 0.3 + Math.sin(time + i) * 20
+    const px = mouseX + Math.cos(angle) * r
+    const py = mouseY + Math.sin(angle) * r
+    const size = 1 + Math.sin(time * 2 + i) * 0.5
+    ctx.beginPath()
+    ctx.arc(px, py, size, 0, Math.PI * 2)
+    ctx.fillStyle = attractMode ? 'rgba(100, 180, 255, 0.3)' : 'rgba(255, 180, 100, 0.3)'
+    ctx.fill()
+  }
+}
+
+// --- Loop ---
+function loop() {
+  updatePhysics()
+  render()
+  requestAnimationFrame(loop)
+}
+
+// --- Events ---
+window.addEventListener('mousemove', e => {
+  mouseX = e.clientX
+  mouseY = e.clientY
+  glow.style.left = mouseX + 'px'
+  glow.style.top = mouseY + 'px'
+})
+
+window.addEventListener('click', () => {
+  attractMode = !attractMode
+  glow.style.background = attractMode
+    ? 'radial-gradient(circle, rgba(80,130,255,0.15) 0%, rgba(50,100,255,0.05) 40%, transparent 70%)'
+    : 'radial-gradient(circle, rgba(255,120,50,0.15) 0%, rgba(255,80,30,0.05) 40%, transparent 70%)'
+})
+
+window.addEventListener('wheel', e => {
+  gravityRadius = Math.max(50, Math.min(400, gravityRadius + e.deltaY * 0.3))
+  gravityStrength = gravityRadius * 0.67
+  glow.style.width = gravityRadius * 1.5 + 'px'
+  glow.style.height = gravityRadius * 1.5 + 'px'
+})
+
+window.addEventListener('resize', resize)
+
+// Touch support
+window.addEventListener('touchmove', e => {
+  e.preventDefault()
+  mouseX = e.touches[0].clientX
+  mouseY = e.touches[0].clientY
+  glow.style.left = mouseX + 'px'
+  glow.style.top = mouseY + 'px'
+}, { passive: false })
+
+window.addEventListener('touchstart', e => {
+  mouseX = e.touches[0].clientX
+  mouseY = e.touches[0].clientY
+})
+
+// --- Init ---
+resize()
+loop()
+</script>
+</body>
+</html>
